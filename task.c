@@ -295,13 +295,16 @@ task_t task_create_on_core(unsigned core, void (*fn)(void), size_t size)
 {
 	static_assert(sizeof(struct task) % 8 == 0);
 
-	assert (size >= 256);
-	assert (core < NUM_CORES);
+	if (size < 256)
+		panic("task_create_on_core: requires at least 256 bytes");
+
+	if (core >= NUM_CORES)
+		panic("invalid core number");
 
 	void *stack = malloc(size);
 
 	if (NULL == stack)
-		panic("task_create: failed to allocate stack (size=%u)", size);
+		panic("task_create_on_core: failed to allocate stack (size=%u)", size);
 
 	struct task *task = stack + size - sizeof(*task);
 	memset(task, 0, sizeof(*task));
