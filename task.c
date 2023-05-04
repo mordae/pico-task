@@ -125,8 +125,6 @@ static int task_select(uint64_t since)
 {
 	static size_t offset[NUM_CORES] = {0};
 
-	uint32_t now = time_us_64();
-
 	unsigned core = get_core_num();
 	int best_task_id = -1;
 	int min_pri = INT_MIN;
@@ -141,7 +139,7 @@ static int task_select(uint64_t since)
 		if (task->lock) {
 			uint32_t lock_id = ((uint32_t)task->lock >> 2) & 0x1f;
 
-			for (int c = 0; c < NUM_CORES; c++) {
+			for (unsigned c = 0; c < NUM_CORES; c++) {
 				if (lock_notify[c][lock_id] >= since) {
 					task->lock = NULL;
 					task->waiting = READY;
@@ -166,9 +164,9 @@ static int task_select(uint64_t since)
 }
 
 
-static int64_t task_hung_alarm(alarm_id_t id, void *arg)
+static int64_t task_hung_alarm(alarm_id_t, void *)
 {
-	for (int i = 0; i < NUM_CORES; i++) {
+	for (unsigned i = 0; i < NUM_CORES; i++) {
 		task_t task = task_running[i];
 
 		if (!task)
@@ -177,7 +175,7 @@ static int64_t task_hung_alarm(alarm_id_t id, void *arg)
 		uint64_t running = time_us_64() - task->resumed_at;
 
 		if (running > HUNG_TIMEOUT) {
-			printf("task: hung task detected: %s (%us)\n",
+			printf("task: hung task detected: %s (%lus)\n",
 			       task->name, (uint32_t)(running / 1000000));
 		}
 	}
@@ -192,7 +190,7 @@ void task_init(void)
 
 	priv_lock = spin_lock_init(spin_lock_claim_unused(true));
 
-	for (int i = 0; i < NUM_CORES; i++) {
+	for (unsigned i = 0; i < NUM_CORES; i++) {
 		task_running[i] = NULL;
 		memset(task_avail[i], 0, sizeof(task_avail[i]));
 	}
@@ -204,11 +202,11 @@ void task_init(void)
 
 bool task_run(uint64_t since)
 {
-	unsigned core = get_core_num();
+	volatile unsigned core = get_core_num();
 
 	__dmb();
 
-	int task_no = task_select(since);
+	volatile int task_no = task_select(since);
 
 	if (task_no < 0)
 		return false;
@@ -317,7 +315,7 @@ task_t task_create_on_core(unsigned core, void (*fn)(void), size_t size)
 	task->waiting = NOT_READY;
 
 	/* Mark stack so that we can determine its usage. */
-	for (int i = 0; i < task->stack_size >> 2; i++)
+	for (size_t i = 0; i < task->stack_size >> 2; i++)
 		task->stack[i] = 0xdeadbeef;
 
 	task->canary = 0xdeadbeef;
@@ -378,7 +376,7 @@ void task_set_priority(task_t task, int8_t pri)
 }
 
 
-static int64_t task_ready_alarm(alarm_id_t id, void *arg)
+static int64_t task_ready_alarm(alarm_id_t, void *arg)
 {
 	task_t task = arg;
 
@@ -454,7 +452,7 @@ static uint32_t stack_free_space(task_t task)
 {
 	uint32_t level = 0;
 
-	for (int i = 0; i < task->stack_size >> 2; i++) {
+	for (size_t i = 0; i < task->stack_size >> 2; i++) {
 		if (0xdeadbeef == task->stack[i]) {
 			level += 4;
 		} else {
@@ -502,11 +500,11 @@ void task_stats_report_reset(unsigned core)
 
 		if (WAITING_FOR_LOCK == task->waiting) {
 			uint32_t lock_id = ((uint32_t)task->lock >> 2) & 0x1f;
-			printf("task: %2i (%-2i %s=%-2i) [%-11s] [%4u] %5ux = %8u us = %3u%%\n",
+			printf("task: %2i (%-2i %s=%-2lu) [%-11s] [%4u] %5lux = %8lu us = %3u%%\n",
 				i, task->pri, flags, lock_id, task->name, stack,
 				stats->resumed, stats->total_us, percent);
 		} else {
-			printf("task: %2i (%-2i %s   ) [%-11s] [%4u] %5ux = %8u us = %3u%%\n",
+			printf("task: %2i (%-2i %s   ) [%-11s] [%4u] %5lux = %8lu us = %3u%%\n",
 				i, task->pri, flags, task->name, stack,
 				stats->resumed, stats->total_us, percent);
 		}
