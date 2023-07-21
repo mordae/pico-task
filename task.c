@@ -338,8 +338,10 @@ void task_yield(void)
 {
 	unsigned core = get_core_num();
 
-	if (NULL == task_running[core])
-		panic("task_yield called from outside of a task");
+	if (NULL == task_running[core]) {
+		__sev();
+		return;
+	}
 
 	if (0 == setjmp(task_running[core]->regs)) {
 		longjmp(task_return[core], TASK_YIELD);
@@ -351,8 +353,9 @@ void task_yield_until_ready(void)
 {
 	unsigned core = get_core_num();
 
-	if (NULL == task_running[core])
+	if (NULL == task_running[core]) {
 		panic("task_yield_until_ready called from outside of a task");
+	}
 
 	task_running[core]->waiting = NOT_READY;
 	task_yield();
@@ -391,8 +394,10 @@ void task_sleep_us(uint64_t us)
 {
 	unsigned core = get_core_num();
 
-	if (NULL == task_running[core])
-		panic("task_sleep_us called from outside of a task");
+	if (NULL == task_running[core]) {
+		sleep_us(us);
+		return;
+	}
 
 	task_t task = task_running[core];
 	task_running[core]->waiting = WAITING_FOR_ALARM;
@@ -405,8 +410,10 @@ void task_sleep_ms(uint64_t ms)
 {
 	unsigned core = get_core_num();
 
-	if (NULL == task_running[core])
-		panic("task_sleep_ms called from outside of a task");
+	if (NULL == task_running[core]) {
+		sleep_ms(ms);
+		return;
+	}
 
 	task_t task = task_running[core];
 	task_running[core]->waiting = WAITING_FOR_ALARM;
@@ -419,8 +426,14 @@ void task_yield_until(uint64_t us)
 {
 	unsigned core = get_core_num();
 
-	if (NULL == task_running[core])
-		panic("task_yield_until called from outside of a task");
+	if (NULL == task_running[core]) {
+		uint64_t now = time_us_64();
+
+		if (now < us)
+			sleep_us(us - now);
+
+		return;
+	}
 
 	task_t task = task_running[core];
 	task_running[core]->waiting = WAITING_FOR_ALARM;
