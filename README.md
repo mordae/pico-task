@@ -1,6 +1,12 @@
 # pico-task: Cooperative Task Scheduler
 
-To use these drivers with `pico-sdk`, modify your `CMakeLists.txt`:
+To use this library with `pico-sdk`, you can add it as a submodule:
+
+```bash
+git submodule add https://github.com/mordae/pico-task.git vendor/pico-task
+```
+
+Modify your `CMakeLists.txt`:
 
 ```cmake
 add_subdirectory(vendor/pico-task)
@@ -9,16 +15,19 @@ add_definitions(-I${CMAKE_CURRENT_LIST_DIR}/vendor/pico-task/include)
 list(APPEND PICO_CONFIG_HEADER_FILES task_hooks.h)
 ```
 
-If you do not have your board header file, create `include/boards/myboard.h` and use it like this:
+If you do not have your board header file, create `include/boards/myboard.h` and add to your `CMakeLists.txt` these lines as well:
 
 ```cmake
 set(PICO_BOARD myboard)
 set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/include/boards)
 ```
 
-Your header file may include the original board file, but it should define following:
+Your header file may include the original board file, but it should define the required constants:
 
 ```c
+/* If you target Raspberry Pi Pico: */
+#include <boards/pico.h>
+
 /* Maximum number of tasks on a single core. */
 #define MAX_TASKS 8
 
@@ -26,11 +35,14 @@ Your header file may include the original board file, but it should define follo
 #define TASK_STACK_SIZE 1024
 ```
 
-See `include/task.h` for interface.
-
 Example usage (in your `main.c`):
 
 ```c
+#include <pico/stdlib.h>
+#include <pico/multicore.h>
+
+#include <task.h>
+
 void power_task(void);
 void input_task(void);
 void sd_task(void);
@@ -78,3 +90,5 @@ int main()
         task_run_loop();
 }
 ```
+
+See `include/task.h` for interface.
