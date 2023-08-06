@@ -15,49 +15,92 @@
  */
 
 #pragma once
-
 #include <pico/types.h>
 #include <hardware/platform_defs.h>
+#include <hardware/sync.h>
 
-/* Maximum number of tasks on a single core. */
+#include <setjmp.h>
+
+#if !defined(TASK_STACK_SIZE)
+# define TASK_STACK_SIZE 1024
+#endif
+
 #if !defined(MAX_TASKS)
 # define MAX_TASKS 8
 #endif
 
-#if !defined(__noreturn)
-# define __noreturn  __attribute__((noreturn))
-#endif
 
-
-/* Private task data. */
-typedef struct task *task_t;
-
-
-/* Per-task statistics. */
-struct task_stats {
-	/* How many times has the task been resumed. */
-	uint32_t resumed;
-
-	/* How many microseconds of runtime has the task collected. */
-	uint32_t total_us;
+enum task_state {
+	TASK_READY = 0,
+	TASK_WAITING_FOR_ALARM,
+	TASK_WAITING_FOR_LOCK,
 };
 
-typedef struct task_stats task_stats_t;
+
+struct task {
+	/* Saved registers, including stack pointer. */
+	jmp_buf regs;
+
+	/* '\0'-terminated task name. */
+	char name[12];
+
+	/* Main procedure of this task. */
+	void (*proc)(void);
+
+	/* Timestamp when was the task resumed the last time. */
+	uint64_t resumed_at;
+
+	/* Task priority. High priority tasks run first. */
+	uint8_t priority;
+
+	/* Reason the task is waiting. */
+	enum task_state state;
+
+	/* How many times has the task been resumed. */
+	uint32_t resume_count;
+
+	/* How many microseconds of runtime has the task collected. */
+	uint32_t runtime_us;
+
+	/* Lock for which the task is waiting. */
+	spin_lock_t *lock;
+
+	/* Stack bottom canary. */
+	uint32_t canary_bottom;
+
+	/* Actual task stack. */
+	uint32_t stack[TASK_STACK_SIZE / 4] __attribute__((__aligned__((8))));
+
+	/* Stack top canary. */
+	uint32_t canary_top;
+};
+
+
+/* Used to define a task in the task list. */
+#define MAKE_TASK(PRI, NAME, PROC) \
+	(&(struct task) { \
+		.name = (NAME), \
+		.proc = (PROC), \
+		.priority = (PRI), \
+	})
+
+
+/* Alias for the task pointer. */
+typedef struct task *task_t;
 
 
 /* Current tasks running on respective cores. */
 extern task_t task_running[NUM_CORES];
 
 
-/* Tasks assigned to respective cores. */
+/*
+ * Tasks assigned to respective cores.
+ * Need to be supplied by the user.
+ */
 extern task_t task_avail[NUM_CORES][MAX_TASKS];
 
 
-/* Collected task statistics. */
-extern task_stats_t task_stats[NUM_CORES][MAX_TASKS];
-
-
-/* Initialize task scheduler. */
+/* Initialize the task scheduler. */
 void task_init(void);
 
 
@@ -78,23 +121,7 @@ bool task_run(uint64_t since);
 /*
  * Run tasks on this core indefinitely.
  */
-__noreturn void task_run_loop(void);
-
-
-/*
- * Create new task with given stack size.
- * Task private data are stored at the top of the stack.
- *
- * Minimum stack size (including internal task data) is 256 bytes.
- *
- * Recommended minimum value is 1024 bytes for when you do not plan to call
- * complex SDK functions. Allocating 4096 bytes should be enough for anything.
- */
-task_t task_create(void (*fn)(void), size_t size);
-
-
-/* Same as `task_create`, but allows specifying the core. */
-task_t task_create_on_core(unsigned core, void (*fn)(void), size_t size);
+void __attribute__((__noreturn__)) task_run_loop(void);
 
 
 /*
@@ -104,16 +131,6 @@ task_t task_create_on_core(unsigned core, void (*fn)(void), size_t size);
  * opportunity to run higher priority tasks if needed.
  */
 void task_yield(void);
-
-
-/*
- * Pause current task and return to the scheduler.
- *
- * Task won't be resumed until marked ready. You need to set an alarm or some
- * other interrupt to mark it once it should be resumed. Or mark it ready from
- * another task.
- */
-void task_yield_until_ready(void);
 
 
 /* Yield task until given amount of microseconds elapses. */
@@ -128,22 +145,9 @@ void task_sleep_ms(uint64_t ms);
 void task_yield_until(uint64_t us);
 
 
-/* Mark given task as ready to continue. */
-void task_set_ready(task_t task);
-
-
-/* Manage task priority. Higher priority tasks run first. */
-void task_set_priority(task_t task, int8_t pri);
-int8_t task_get_priority(task_t task);
-
-
-/* Manage task name of up to 11 bytes. */
-void task_set_name(task_t task, const char *name);
-void task_get_name(task_t task, char name[9]);
-
-
 /* Print per-task statistics for given core and then reset them. */
 void task_stats_report_reset(unsigned core);
+
 
 /* Reset task statistics for given core. */
 void task_stats_reset(unsigned core);

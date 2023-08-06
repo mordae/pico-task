@@ -16,14 +16,11 @@
 
 #include "task.h"
 
-#include <pico/stdlib.h>
 #include <pico/lock_core.h>
-#include <hardware/sync.h>
 
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
-#include <setjmp.h>
 #include <stdio.h>
 
 #define HUNG_TIMEOUT 1000000
@@ -43,47 +40,6 @@ enum {
 };
 
 
-enum wait_reason {
-	READY = 0,
-	NOT_READY,
-	WAITING_FOR_ALARM,
-	WAITING_FOR_LOCK,
-};
-
-
-struct task {
-	/* Saved registers, including stack pointer. */
-	jmp_buf regs;
-
-	/* Bottom of the stack. */
-	uint32_t *stack;
-
-	/* Size of the stack. */
-	uint32_t stack_size;
-
-	/* '\0'-terminated task name. */
-	char name[12];
-
-	/* Timestamp when was the task resumed the last time. */
-	uint64_t resumed_at;
-
-	/* Reason the task is waiting. */
-	enum wait_reason waiting : 3;
-
-	/* Task priority. High priority tasks run first. */
-	int8_t pri : 8;
-
-	/* To pad the struct to 128 bytes. */
-	uint32_t _align_pad_21 : 21;
-
-	/* Lock for which the task is waiting. */
-	spin_lock_t *lock;
-
-	/* Stack top canary. */
-	uint32_t canary;
-};
-
-
 enum task_status {
 	TASK_SAVE = 0,
 	TASK_YIELD,
@@ -91,18 +47,17 @@ enum task_status {
 };
 
 
-uint64_t lock_notify[NUM_CORES][32] = {0};
-
-
-task_t task_running[NUM_CORES] = {0};
-task_t task_avail[NUM_CORES][MAX_TASKS] = {0};
-
-task_stats_t task_stats[NUM_CORES][MAX_TASKS] = {0};
-
-
-/* Saved scheduler context for respective cores. */
+/* Saved scheduler context for respective cores: */
 static jmp_buf task_return[NUM_CORES];
 
+/* Spinlock notifications for respective cores: */
+static uint64_t lock_notify[NUM_CORES][32] = {0};
+
+/* Microseconds since last per-core stats reset. */
+static uint64_t last_reset[NUM_CORES] = {0};
+
+/* Currently running tasks for respective cores: */
+task_t task_running[NUM_CORES] = {NULL};
 
 /* Spinlock to protect private data from concurrent access. */
 static spin_lock_t *priv_lock = NULL;
@@ -133,7 +88,7 @@ static int task_select(uint64_t since)
 		size_t tid = (offset[core] + i) % MAX_TASKS;
 		task_t task = task_avail[core][tid];
 
-		if (!task)
+		if (NULL == task)
 			continue;
 
 		if (task->lock) {
@@ -142,17 +97,17 @@ static int task_select(uint64_t since)
 			for (unsigned c = 0; c < NUM_CORES; c++) {
 				if (lock_notify[c][lock_id] >= since) {
 					task->lock = NULL;
-					task->waiting = READY;
+					task->state = TASK_READY;
 					break;
 				}
 			}
 		}
 
-		if (task->waiting)
+		if (TASK_READY != task->state)
 			continue;
 
-		if (task->pri > min_pri) {
-			min_pri = task->pri;
+		if (task->priority > min_pri) {
+			min_pri = task->priority;
 			best_task_id = tid;
 		}
 	}
@@ -186,13 +141,39 @@ static int64_t task_hung_alarm(alarm_id_t, void *)
 
 void task_init(void)
 {
+	/*
+	 * Make sure that the default alarm pool is ready. We use it for
+	 * task_sleep_{ms,us} functions and for the hung task detector.
+	 */
 	alarm_pool_init_default();
 
+	/* Allocate a spin lock to protect our data structures. */
 	priv_lock = spin_lock_init(spin_lock_claim_unused(true));
 
+	/* Initialize the defined tasks. */
 	for (unsigned i = 0; i < NUM_CORES; i++) {
+		for (unsigned t = 0; /**/; t++) {
+			task_t task = task_avail[i][t];
+
+			if (NULL == task)
+				break;
+
+			/* Install stack canary values. */
+			task->canary_top = 0xdeadbeef;
+			task->canary_bottom = 0xdeadbeef;
+
+			/* Mark the whole stack as unused. */
+			for (int j = 0; j < TASK_STACK_SIZE / 4; j++)
+				task->stack[j] = 0xdeadbeef;
+
+			/* Prepare to run the task procedure. */
+			task->regs[SP] = (unsigned)&task->canary_top;
+			task->regs[PC] = (unsigned)task_sentinel;
+			task->regs[R4] = (unsigned)task->proc;
+		}
+
+		/* Make sure we start without any active tasks. */
 		task_running[i] = NULL;
-		memset(task_avail[i], 0, sizeof(task_avail[i]));
 	}
 
 	/* Start hung task detector. */
@@ -217,41 +198,30 @@ bool task_run(uint64_t since)
 	status = setjmp(task_return[core]);
 
 	if (TASK_SAVE == status) {
-		task_stats[core][task_no].resumed++;
-		task_avail[core][task_no]->resumed_at = time_us_64();
+		task->resume_count++;
+		task->resumed_at = time_us_64();
 		task_running[core] = task;
 		longjmp(task->regs, (int)task);
 	}
 
-	if (TASK_YIELD == status) {
-		uint64_t since = task->resumed_at;
-		task_stats[core][task_no].total_us += time_us_64() - since;
-		task_running[core] = NULL;
+	since = task->resumed_at;
+	task->runtime_us += time_us_64() - since;
+	task_running[core] = NULL;
 
-		if (0xdeadbeef != task->canary)
-			panic("task [%s]: stack underflow", task->name);
+	if (0xdeadbeef != task->canary_top)
+		panic("task [%s]: stack underflow", task->name);
 
-		if (0xdeadbeef != task->stack[0])
-			panic("task [%s]: stack overflow", task->name);
+	if (0xdeadbeef != task->canary_bottom)
+		panic("task [%s]: stack overflow", task->name);
 
+	if (TASK_YIELD == status)
 		return true;
-	}
 
 	if (TASK_RETURN == status) {
-		task_running[core] = NULL;
-
-		uint32_t save = spin_lock_blocking(priv_lock);
-		task_avail[core][task_no] = NULL;
-		spin_unlock(priv_lock, save);
-
-		if (0xdeadbeef != task->canary)
-			panic("task [%s]: stack underflow", task->name);
-
-		if (0xdeadbeef != task->stack[0])
-			panic("task [%s]: stack overflow", task->name);
-
-		free(task->stack);
-
+		/* Restart the task: */
+		task->regs[SP] = (unsigned)&task->canary_top;
+		task->regs[PC] = (unsigned)task_sentinel;
+		task->regs[R4] = (unsigned)task->proc;
 		return true;
 	}
 
@@ -259,7 +229,7 @@ bool task_run(uint64_t since)
 }
 
 
-__noreturn void task_run_loop(void)
+void __attribute__((__noreturn__)) task_run_loop(void)
 {
 	uint32_t now = 0;
 	uint32_t prev = 0;
@@ -283,57 +253,6 @@ __noreturn void task_run_loop(void)
 }
 
 
-task_t task_create(void (*fn)(void), size_t size)
-{
-	return task_create_on_core(get_core_num(), fn, size);
-}
-
-
-task_t task_create_on_core(unsigned core, void (*fn)(void), size_t size)
-{
-	static_assert(sizeof(struct task) % 8 == 0);
-
-	if (size < 256)
-		panic("task_create_on_core: requires at least 256 bytes");
-
-	if (core >= NUM_CORES)
-		panic("invalid core number");
-
-	void *stack = malloc(size);
-
-	if (NULL == stack)
-		panic("task_create_on_core: failed to allocate stack (size=%u)", size);
-
-	struct task *task = stack + size - sizeof(*task);
-	memset(task, 0, sizeof(*task));
-
-	task->stack = stack;
-	task->stack_size = size - sizeof(*task);
-	task->regs[SP] = (unsigned)task;
-	task->regs[PC] = (unsigned)task_sentinel;
-	task->regs[R4] = (unsigned)fn;
-	task->waiting = NOT_READY;
-
-	/* Mark stack so that we can determine its usage. */
-	for (size_t i = 0; i < task->stack_size >> 2; i++)
-		task->stack[i] = 0xdeadbeef;
-
-	task->canary = 0xdeadbeef;
-
-	uint32_t save = spin_lock_blocking(priv_lock);
-
-	for (int i = 0; i < MAX_TASKS; i++) {
-		if (!task_avail[core][i]) {
-			task_avail[core][i] = task;
-			spin_unlock(priv_lock, save);
-			return task;
-		}
-	}
-
-	panic("Too many tasks on core %u (MAX_TASKS=%u)", core, MAX_TASKS);
-}
-
-
 void task_yield(void)
 {
 	unsigned core = get_core_num();
@@ -349,42 +268,12 @@ void task_yield(void)
 }
 
 
-void task_yield_until_ready(void)
-{
-	unsigned core = get_core_num();
-
-	if (NULL == task_running[core]) {
-		panic("task_yield_until_ready called from outside of a task");
-	}
-
-	task_running[core]->waiting = NOT_READY;
-	task_yield();
-}
-
-
-void task_set_ready(task_t task)
-{
-	uint32_t save = spin_lock_blocking(priv_lock);
-
-	if (task->waiting == NOT_READY)
-		task->waiting = READY;
-
-	spin_unlock(priv_lock, save);
-}
-
-
-void task_set_priority(task_t task, int8_t pri)
-{
-	task->pri = pri;
-}
-
-
 static int64_t task_ready_alarm(alarm_id_t, void *arg)
 {
 	task_t task = arg;
 
-	if (WAITING_FOR_ALARM == task->waiting)
-		task->waiting = READY;
+	if (TASK_WAITING_FOR_ALARM == task->state)
+		task->state = TASK_READY;
 
 	return 0;
 }
@@ -400,7 +289,7 @@ void task_sleep_us(uint64_t us)
 	}
 
 	task_t task = task_running[core];
-	task_running[core]->waiting = WAITING_FOR_ALARM;
+	task_running[core]->state = TASK_WAITING_FOR_ALARM;
 	(void)add_alarm_in_us(us, task_ready_alarm, task, true);
 	task_yield();
 }
@@ -416,7 +305,7 @@ void task_sleep_ms(uint64_t ms)
 	}
 
 	task_t task = task_running[core];
-	task_running[core]->waiting = WAITING_FOR_ALARM;
+	task_running[core]->state = TASK_WAITING_FOR_ALARM;
 	(void)add_alarm_in_us(1000 * ms, task_ready_alarm, task, true);
 	task_yield();
 }
@@ -436,28 +325,9 @@ void task_yield_until(uint64_t us)
 	}
 
 	task_t task = task_running[core];
-	task_running[core]->waiting = WAITING_FOR_ALARM;
+	task_running[core]->state = TASK_WAITING_FOR_ALARM;
 	(void)add_alarm_at(us, task_ready_alarm, task, true);
 	task_yield();
-}
-
-
-int8_t task_get_priority(task_t task)
-{
-	return task->pri;
-}
-
-
-void task_set_name(task_t task, const char *name)
-{
-	strncpy(task->name, name, sizeof(task->name));
-	task->name[sizeof(task->name) - 1] = '\0';
-}
-
-
-void task_get_name(task_t task, char name[9])
-{
-	strcpy(name, task->name);
 }
 
 
@@ -465,7 +335,7 @@ static uint32_t stack_free_space(task_t task)
 {
 	uint32_t level = 0;
 
-	for (size_t i = 0; i < task->stack_size >> 2; i++) {
+	for (size_t i = 0; i < TASK_STACK_SIZE / 4; i++) {
 		if (0xdeadbeef == task->stack[i]) {
 			level += 4;
 		} else {
@@ -479,10 +349,7 @@ static uint32_t stack_free_space(task_t task)
 
 void task_stats_report_reset(unsigned core)
 {
-	uint32_t total_us = 0;
-
-	for (int i = 0; i < MAX_TASKS; i++)
-		total_us += task_stats[core][i].total_us;
+	uint64_t total_us = time_us_64() - last_reset[core];
 
 	if (!total_us)
 		total_us = 1;
@@ -490,37 +357,36 @@ void task_stats_report_reset(unsigned core)
 	printf("task: core %u:\n", core);
 
 	for (int i = 0; i < MAX_TASKS; i++) {
-		if (NULL == task_avail[core][i])
-			continue;
-
 		task_t task = task_avail[core][i];
-		task_stats_t *stats = &task_stats[core][i];
 
-		unsigned percent = 100 * stats->total_us / total_us;
+		if (NULL == task)
+			break;
+
+		unsigned percent = 100llu * task->runtime_us / total_us;
 
 		char flags[] = "?";
 
-		if (READY == task->waiting)
+		if (TASK_READY == task->state)
 			flags[0] = 'R';
-		else if (NOT_READY == task->waiting)
-			flags[0] = 'X';
-		else if (WAITING_FOR_ALARM == task->waiting)
+		else if (TASK_WAITING_FOR_ALARM == task->state)
 			flags[0] = 'A';
-		else if (WAITING_FOR_LOCK == task->waiting)
+		else if (TASK_WAITING_FOR_LOCK == task->state)
 			flags[0] = 'L';
 
 		unsigned stack = stack_free_space(task);
 
-		if (WAITING_FOR_LOCK == task->waiting) {
+		printf("task: %2i (%-2i %s", i, task->priority, flags);
+
+		if (TASK_WAITING_FOR_LOCK == task->state) {
 			uint32_t lock_id = ((uint32_t)task->lock >> 2) & 0x1f;
-			printf("task: %2i (%-2i %s=%-2lu) [%-11s] [%4u] %5lux = %8lu us = %3u%%\n",
-				i, task->pri, flags, lock_id, task->name, stack,
-				stats->resumed, stats->total_us, percent);
+			printf("=%-2lu", lock_id);
 		} else {
-			printf("task: %2i (%-2i %s   ) [%-11s] [%4u] %5lux = %8lu us = %3u%%\n",
-				i, task->pri, flags, task->name, stack,
-				stats->resumed, stats->total_us, percent);
+			printf("   ");
 		}
+
+		printf(") [%-11s]", task->name);
+		printf(" [%4u] %5lux ", stack, task->resume_count);
+		printf("= %8lu us = %3u%%\n", task->runtime_us, percent);
 	}
 
 	task_stats_reset(core);
@@ -529,7 +395,17 @@ void task_stats_report_reset(unsigned core)
 
 void task_stats_reset(unsigned core)
 {
-	memset(task_stats[core], 0, sizeof(task_stats[core]));
+	for (unsigned t = 0; t < MAX_TASKS; t++) {
+		task_t task = task_avail[core][t];
+
+		if (NULL == task)
+			break;
+
+		task->resume_count = 0;
+		task->runtime_us = 0;
+	}
+
+	last_reset[core] = time_us_64();
 }
 
 
@@ -556,7 +432,7 @@ void task_lock_spin_unlock_with_wait(struct lock_core *lc, uint32_t save)
 
 	if (task) {
 		task->lock = lc->spin_lock;
-		task->waiting = WAITING_FOR_LOCK;
+		task->state = TASK_WAITING_FOR_LOCK;
 		spin_unlock(lc->spin_lock, save);
 		task_yield();
 	} else {
@@ -572,7 +448,7 @@ int task_lock_spin_unlock_with_timeout(struct lock_core *lc, uint32_t save, uint
 
 	if (task) {
 		task->lock = lc->spin_lock;
-		task->waiting = WAITING_FOR_LOCK;
+		task->state = TASK_WAITING_FOR_LOCK;
 		spin_unlock(lc->spin_lock, save);
 		task_yield();
 		return time_us_64() >= time;
