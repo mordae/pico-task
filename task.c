@@ -17,6 +17,7 @@
 #include "task.h"
 
 #include <pico/lock_core.h>
+//#include <hardware/sync.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -26,29 +27,26 @@
 #define HUNG_TIMEOUT 1000000
 
 
-enum {
-	R4 = 0,
-	R5,
-	R6,
-	R7,
-	R8,
-	R9,
-	R10,
-	FP,
-	SP,
-	PC,
-};
-
-
+/* Meaning of status codes exchanged by tasks via task_swap_context. */
 enum task_status {
-	TASK_SAVE = 0,
-	TASK_YIELD,
-	TASK_RETURN,
+	TASK_RUN = 0,		/* Task is being resumed. */
+	TASK_YIELD = 1,		/* Task has yielded and can be resumed. */
+	TASK_RETURN = 2,	/* Task has exited and must be restarted. */
 };
 
+/*
+ * Swap running task by storing and replacing register values.
+ * First argument is used to pass status messages between the tasks.
+ */
+enum task_status task_swap_context(enum task_status,
+                                   unsigned load[TASK_NUM_REGS],
+                                   unsigned save[TASK_NUM_REGS]);
 
-/* Saved scheduler context for respective cores: */
-static jmp_buf task_return[NUM_CORES];
+/* Saved register offsets. */
+enum reg_offset { SP = 0, R4, R5, R6, R7, R8, R9, R10, R11, R12, LR };
+
+/* Saved scheduler registers for respective cores: */
+static unsigned task_return[NUM_CORES][TASK_NUM_REGS];
 
 /* Spinlock notifications for respective cores: */
 static uint64_t lock_notify[NUM_CORES][32] = {0};
@@ -59,24 +57,25 @@ static uint64_t last_reset[NUM_CORES] = {0};
 /* Currently running tasks for respective cores: */
 task_t task_running[NUM_CORES] = {NULL};
 
-/* Spinlock to protect private data from concurrent access. */
-static spin_lock_t *priv_lock = NULL;
-
 
 /*
- * Starts task in the R4 register and converts its return
- * into longjmp back into the scheduler.
+ * Start task in the R4 register and convert its return into a swap back
+ * to the scheduler. Otherwise a task returning would be undefined and
+ * probably catastrophic.
  */
 static void task_sentinel(void)
 {
 	void (*fn)(void);
 	asm volatile ("mov %0, r4" : "=r"(fn));
 	fn();
-	longjmp(task_return[get_core_num()], TASK_RETURN);
+
+	unsigned core = get_core_num();
+	task_t task = task_running[core];
+	task_swap_context(TASK_RETURN, task_return[core], task->regs);
 }
 
 
-static int task_select(uint64_t since)
+static int task_select(void)
 {
 	static size_t offset[NUM_CORES] = {0};
 
@@ -91,13 +90,11 @@ static int task_select(uint64_t since)
 		if (NULL == task)
 			continue;
 
-		if (task->lock) {
-			uint32_t lock_id = ((uint32_t)task->lock >> 2) & 0x1f;
-
+		if (TASK_WAITING_FOR_LOCK == task->state) {
 			for (unsigned c = 0; c < NUM_CORES; c++) {
-				if (lock_notify[c][lock_id] >= since) {
-					task->lock = NULL;
+				if (lock_notify[c][task->lock_id] >= task->resumed_at) {
 					task->state = TASK_READY;
+					task->lock_id = -1;
 					break;
 				}
 			}
@@ -147,9 +144,6 @@ void task_init(void)
 	 */
 	alarm_pool_init_default();
 
-	/* Allocate a spin lock to protect our data structures. */
-	priv_lock = spin_lock_init(spin_lock_claim_unused(true));
-
 	/* Initialize the defined tasks. */
 	for (unsigned i = 0; i < NUM_CORES; i++) {
 		for (unsigned t = 0; /**/; t++) {
@@ -168,7 +162,7 @@ void task_init(void)
 
 			/* Prepare to run the task procedure. */
 			task->regs[SP] = (unsigned)&task->canary_top;
-			task->regs[PC] = (unsigned)task_sentinel;
+			task->regs[LR] = (unsigned)task_sentinel;
 			task->regs[R4] = (unsigned)task->proc;
 		}
 
@@ -181,31 +175,24 @@ void task_init(void)
 }
 
 
-bool task_run(uint64_t since)
+bool task_run(void)
 {
-	volatile unsigned core = get_core_num();
-
-	__dmb();
-
-	volatile int task_no = task_select(since);
+	unsigned core = get_core_num();
+	int task_no = task_select();
 
 	if (task_no < 0)
 		return false;
 
 	task_t task = task_avail[core][task_no];
 
+	task_running[core] = task;
+	task->resume_count++;
+	task->resumed_at = time_us_64();
+
 	enum task_status status;
-	status = setjmp(task_return[core]);
+	status = task_swap_context(TASK_RUN, task->regs, task_return[core]);
 
-	if (TASK_SAVE == status) {
-		task->resume_count++;
-		task->resumed_at = time_us_64();
-		task_running[core] = task;
-		longjmp(task->regs, (int)task);
-	}
-
-	since = task->resumed_at;
-	task->runtime_us += time_us_64() - since;
+	task->runtime_us += time_us_64() - task->resumed_at;
 	task_running[core] = NULL;
 
 	if (0xdeadbeef != task->canary_top)
@@ -220,27 +207,20 @@ bool task_run(uint64_t since)
 	if (TASK_RETURN == status) {
 		/* Restart the task: */
 		task->regs[SP] = (unsigned)&task->canary_top;
-		task->regs[PC] = (unsigned)task_sentinel;
+		task->regs[LR] = (unsigned)task_sentinel;
 		task->regs[R4] = (unsigned)task->proc;
 		return true;
 	}
 
-	panic("invalid setjmp status (%i)", status);
+	panic("task: invalid status (%i)", status);
 }
 
 
 void __attribute__((__noreturn__)) task_run_loop(void)
 {
-	uint32_t now = 0;
-	uint32_t prev = 0;
-
 	while (true) {
 		/* Work until we run out of ready tasks. */
-		while (true) {
-			now = time_us_64();
-			task_run(prev);
-			prev = now;
-		}
+		while (task_run());
 
 		/*
 		 * Sleep until an interrupt or event happens.
@@ -256,15 +236,14 @@ void __attribute__((__noreturn__)) task_run_loop(void)
 void task_yield(void)
 {
 	unsigned core = get_core_num();
+	task_t task = task_running[core];
 
-	if (NULL == task_running[core]) {
+	if (NULL == task) {
 		__sev();
 		return;
 	}
 
-	if (0 == setjmp(task_running[core]->regs)) {
-		longjmp(task_return[core], TASK_YIELD);
-	}
+	task_swap_context(TASK_YIELD, task_return[core], task->regs);
 }
 
 
@@ -272,8 +251,13 @@ static int64_t task_ready_alarm(alarm_id_t, void *arg)
 {
 	task_t task = arg;
 
-	if (TASK_WAITING_FOR_ALARM == task->state)
+	if (TASK_WAITING_FOR_ALARM == task->state) {
+		/* Mark the task as ready. */
 		task->state = TASK_READY;
+
+		/* Unblock the scheduler. */
+		__sev();
+	}
 
 	return 0;
 }
@@ -362,30 +346,31 @@ void task_stats_report_reset(unsigned core)
 		if (NULL == task)
 			break;
 
-		unsigned percent = 100llu * task->runtime_us / total_us;
-
-		char flags[] = "?";
-
-		if (TASK_READY == task->state)
-			flags[0] = 'R';
-		else if (TASK_WAITING_FOR_ALARM == task->state)
-			flags[0] = 'A';
-		else if (TASK_WAITING_FOR_LOCK == task->state)
-			flags[0] = 'L';
-
 		unsigned stack = stack_free_space(task);
 
-		printf("task: %2i (%-2i %s", i, task->priority, flags);
+		char flags[] = "?";
+		int lock_id = task->lock_id;
+		enum task_state state = task->state;
 
-		if (TASK_WAITING_FOR_LOCK == task->state) {
-			uint32_t lock_id = ((uint32_t)task->lock >> 2) & 0x1f;
-			printf("=%-2lu", lock_id);
+		if (TASK_READY == state)
+			flags[0] = 'R';
+		else if (TASK_WAITING_FOR_ALARM == state)
+			flags[0] = 'A';
+		else if (TASK_WAITING_FOR_LOCK == state)
+			flags[0] = 'L';
+
+		printf("task: %2i (%-2i ", i, task->priority);
+
+		if (TASK_WAITING_FOR_LOCK == state) {
+			printf("%s=%-2i", flags, lock_id);
 		} else {
-			printf("   ");
+			printf("%s   ", flags);
 		}
 
 		printf(") [%-11s]", task->name);
 		printf(" [%4u] %5lux ", stack, task->resume_count);
+
+		unsigned percent = 100llu * task->runtime_us / total_us;
 		printf("= %8lu us = %3u%%\n", task->runtime_us, percent);
 	}
 
@@ -418,10 +403,11 @@ void task_lock_spin_unlock_with_notify(struct lock_core *lc, uint32_t save)
 	/* Unlock the lock. */
 	spin_unlock(lc->spin_lock, save);
 
+	/* Notify the schedulers. */
 	uint32_t lock_id = ((uint32_t)lc->spin_lock >> 2) & 0x1f;
 	lock_notify[get_core_num()][lock_id] = time_us_64();
 
-	/* Unblock the schedulers. */
+	/* Unblock the scheduler on the other core. */
 	__sev();
 }
 
@@ -431,9 +417,9 @@ void task_lock_spin_unlock_with_wait(struct lock_core *lc, uint32_t save)
 	task_t task = task_running[core];
 
 	if (task) {
-		task->lock = lc->spin_lock;
-		task->state = TASK_WAITING_FOR_LOCK;
 		spin_unlock(lc->spin_lock, save);
+		task->state = TASK_WAITING_FOR_LOCK;
+		task->lock_id = ((uint32_t)lc->spin_lock >> 2) & 0x1f;
 		task_yield();
 	} else {
 		spin_unlock(lc->spin_lock, save);
@@ -447,9 +433,9 @@ int task_lock_spin_unlock_with_timeout(struct lock_core *lc, uint32_t save, uint
 	task_t task = task_running[core];
 
 	if (task) {
-		task->lock = lc->spin_lock;
-		task->state = TASK_WAITING_FOR_LOCK;
 		spin_unlock(lc->spin_lock, save);
+		task->state = TASK_WAITING_FOR_LOCK;
+		task->lock_id = ((uint32_t)lc->spin_lock >> 2) & 0x1f;
 		task_yield();
 		return time_us_64() >= time;
 	} else {
@@ -460,7 +446,5 @@ int task_lock_spin_unlock_with_timeout(struct lock_core *lc, uint32_t save, uint
 
 void task_sync_yield_until_before(uint64_t time)
 {
-	if (task_running[get_core_num()]) {
-		task_yield_until(time);
-	}
+	task_yield_until(time);
 }

@@ -17,9 +17,6 @@
 #pragma once
 #include <pico/types.h>
 #include <hardware/platform_defs.h>
-#include <hardware/sync.h>
-
-#include <setjmp.h>
 
 #if !defined(TASK_STACK_SIZE)
 # define TASK_STACK_SIZE 1024
@@ -28,6 +25,8 @@
 #if !defined(MAX_TASKS)
 # define MAX_TASKS 8
 #endif
+
+#define TASK_NUM_REGS 11
 
 
 enum task_state {
@@ -38,8 +37,8 @@ enum task_state {
 
 
 struct task {
-	/* Saved registers, including stack pointer. */
-	jmp_buf regs;
+	/* Saved registers. */
+	unsigned regs[TASK_NUM_REGS];
 
 	/* '\0'-terminated task name. */
 	char name[12];
@@ -54,16 +53,19 @@ struct task {
 	uint8_t priority;
 
 	/* Reason the task is waiting. */
-	enum task_state state;
+	enum task_state state : 8;
+
+	/* Lock for which the task is waiting. */
+	int lock_id : 24;
+
+	/* Notification about lock status. */
+	uint32_t notify;
 
 	/* How many times has the task been resumed. */
 	uint32_t resume_count;
 
 	/* How many microseconds of runtime has the task collected. */
 	uint32_t runtime_us;
-
-	/* Lock for which the task is waiting. */
-	spin_lock_t *lock;
 
 	/* Stack bottom canary. */
 	uint32_t canary_bottom;
@@ -110,12 +112,10 @@ void task_init(void);
  *
  * You must call `__wfe()` to put the core to sleep when there is nothing more
  * to do, but make sure to only call it after `task_run` has returned `false`.
- * You also need to pass in the timestamp from just before the last time the
- * `task_run` was invoked.
  *
  * Or just use `task_run_loop`.
  */
-bool task_run(uint64_t since);
+bool task_run(void);
 
 
 /*
