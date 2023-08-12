@@ -368,10 +368,8 @@ void task_stats_report_reset(unsigned core)
 		}
 
 		printf(") [%-11s]", task->name);
-		printf(" [%4u] %5lux ", stack, task->resume_count);
-
-		unsigned percent = 100llu * task->runtime_us / total_us;
-		printf("= %8lu us = %3u%%\n", task->runtime_us, percent);
+		printf(" [%4u] %8.2fx ", stack, 1000000.0 * task->resume_count / total_us);
+		printf("=> %4llu ms/s\n", 1000llu * task->runtime_us / total_us);
 	}
 
 	task_stats_reset(core);
