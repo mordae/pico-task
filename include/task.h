@@ -15,26 +15,24 @@
  */
 
 #pragma once
-#include <pico/types.h>
+#include <pico/stdlib.h>
 #include <hardware/platform_defs.h>
 
 #if !defined(TASK_STACK_SIZE)
-# define TASK_STACK_SIZE 1024
+#define TASK_STACK_SIZE 1024
 #endif
 
 #if !defined(MAX_TASKS)
-# define MAX_TASKS 8
+#define MAX_TASKS 8
 #endif
 
 #define TASK_NUM_REGS 11
-
 
 enum task_state {
 	TASK_READY = 0,
 	TASK_WAITING_FOR_ALARM,
 	TASK_WAITING_FOR_LOCK,
 };
-
 
 struct task {
 	/* Saved registers. */
@@ -77,23 +75,19 @@ struct task {
 	uint32_t canary_top;
 };
 
-
 /* Used to define a task in the task list. */
 #define MAKE_TASK(PRI, NAME, PROC) \
-	(&(struct task) { \
-		.name = (NAME), \
-		.proc = (PROC), \
+	(&(struct task){           \
+		.name = (NAME),    \
+		.proc = (PROC),    \
 		.priority = (PRI), \
 	})
-
 
 /* Alias for the task pointer. */
 typedef struct task *task_t;
 
-
 /* Current tasks running on respective cores. */
 extern task_t task_running[NUM_CORES];
-
 
 /*
  * Tasks assigned to respective cores.
@@ -101,10 +95,8 @@ extern task_t task_running[NUM_CORES];
  */
 extern task_t task_avail[NUM_CORES][MAX_TASKS];
 
-
 /* Initialize the task scheduler. */
 void task_init(void);
-
 
 /*
  * Run a single task scheduled on the current core until it yields or returns.
@@ -117,12 +109,10 @@ void task_init(void);
  */
 bool task_run(void);
 
-
 /*
  * Run tasks on this core indefinitely.
  */
 void __attribute__((__noreturn__)) task_run_loop(void);
-
 
 /*
  * Pause current task and return to the scheduler.
@@ -132,22 +122,17 @@ void __attribute__((__noreturn__)) task_run_loop(void);
  */
 void task_yield(void);
 
-
 /* Yield task until given amount of microseconds elapses. */
 void task_sleep_us(uint64_t us);
-
 
 /* Yield task until given amount of milliseconds elapses. */
 void task_sleep_ms(uint64_t ms);
 
-
 /* Yield task until given time in microseconds. */
 void task_yield_until(uint64_t us);
 
-
 /* Print per-task statistics for given core and then reset them. */
 void task_stats_report_reset(unsigned core);
-
 
 /* Reset task statistics for given core. */
 void task_stats_reset(unsigned core);
