@@ -28,14 +28,13 @@
 #define lock_internal_spin_unlock_with_wait(lock, save) \
 	task_lock_spin_unlock_with_wait((lock), (save))
 
-#define sync_internal_yield_until_before(until) \
-	task_sync_yield_until_before((until))
+#define sync_internal_yield_until_before(until) task_sync_yield_until_before((until))
 
 struct lock_core;
 
 void task_lock_spin_unlock_with_notify(struct lock_core *lc, uint32_t save);
 void task_lock_spin_unlock_with_wait(struct lock_core *lc, uint32_t save);
-int task_lock_spin_unlock_with_timeout(struct lock_core *lc, uint32_t save, uint64_t time);
-void task_sync_yield_until_before(uint64_t time);
+int task_lock_spin_unlock_with_timeout(struct lock_core *lc, uint32_t save, absolute_time_t time);
+void task_sync_yield_until_before(absolute_time_t time);
 
 #endif

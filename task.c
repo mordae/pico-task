@@ -17,7 +17,6 @@
 #include "task.h"
 
 #include <pico/lock_core.h>
-//#include <hardware/sync.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -26,21 +25,19 @@
 
 #define HUNG_TIMEOUT 1000000
 
-
 /* Meaning of status codes exchanged by tasks via task_swap_context. */
 enum task_status {
-	TASK_RUN = 0,		/* Task is being resumed. */
-	TASK_YIELD = 1,		/* Task has yielded and can be resumed. */
-	TASK_RETURN = 2,	/* Task has exited and must be restarted. */
+	TASK_RUN = 0,	 /* Task is being resumed. */
+	TASK_YIELD = 1,	 /* Task has yielded and can be resumed. */
+	TASK_RETURN = 2, /* Task has exited and must be restarted. */
 };
 
 /*
  * Swap running task by storing and replacing register values.
  * First argument is used to pass status messages between the tasks.
  */
-enum task_status task_swap_context(enum task_status,
-                                   unsigned load[TASK_NUM_REGS],
-                                   unsigned save[TASK_NUM_REGS]);
+enum task_status task_swap_context(enum task_status, unsigned load[TASK_NUM_REGS],
+				   unsigned save[TASK_NUM_REGS]);
 
 /* Saved register offsets. */
 enum reg_offset { SP = 0, R4, R5, R6, R7, R8, R9, R10, R11, R12, LR };
@@ -49,14 +46,13 @@ enum reg_offset { SP = 0, R4, R5, R6, R7, R8, R9, R10, R11, R12, LR };
 static unsigned task_return[NUM_CORES][TASK_NUM_REGS];
 
 /* Spinlock notifications for respective cores: */
-static uint64_t lock_notify[NUM_CORES][32] = {0};
+static uint64_t lock_notify[NUM_CORES][32] = { 0 };
 
 /* Microseconds since last per-core stats reset. */
-static uint64_t last_reset[NUM_CORES] = {0};
+static uint64_t last_reset[NUM_CORES] = { 0 };
 
 /* Currently running tasks for respective cores: */
-task_t task_running[NUM_CORES] = {NULL};
-
+task_t task_running[NUM_CORES] = { NULL };
 
 /*
  * Start task in the R4 register and convert its return into a swap back
@@ -66,7 +62,7 @@ task_t task_running[NUM_CORES] = {NULL};
 static void task_sentinel(void)
 {
 	void (*fn)(void);
-	asm volatile ("mov %0, r4" : "=r"(fn));
+	asm volatile("mov %0, r4" : "=r"(fn));
 	fn();
 
 	unsigned core = get_core_num();
@@ -74,10 +70,9 @@ static void task_sentinel(void)
 	task_swap_context(TASK_RETURN, task_return[core], task->regs);
 }
 
-
 static int task_select(void)
 {
-	static size_t offset[NUM_CORES] = {0};
+	static size_t offset[NUM_CORES] = { 0 };
 
 	unsigned core = get_core_num();
 	int best_task_id = -1;
@@ -115,8 +110,7 @@ static int task_select(void)
 	return best_task_id;
 }
 
-
-static int64_t task_hung_alarm(alarm_id_t, void *)
+static int64_t task_hung_alarm(__unused alarm_id_t alarm, __unused void *arg)
 {
 	for (unsigned i = 0; i < NUM_CORES; i++) {
 		task_t task = task_running[i];
@@ -127,14 +121,13 @@ static int64_t task_hung_alarm(alarm_id_t, void *)
 		uint64_t running = time_us_64() - task->resumed_at;
 
 		if (running > HUNG_TIMEOUT) {
-			printf("task: hung task detected: %s (%lus)\n",
-			       task->name, (uint32_t)(running / 1000000));
+			printf("task: hung task detected: %s (%us)\n", task->name,
+			       (unsigned)(running / 1000000));
 		}
 	}
 
 	return -HUNG_TIMEOUT;
 }
-
 
 void task_init(void)
 {
@@ -173,7 +166,6 @@ void task_init(void)
 	/* Start hung task detector. */
 	(void)add_alarm_in_us(HUNG_TIMEOUT, task_hung_alarm, NULL, true);
 }
-
 
 bool task_run(void)
 {
@@ -215,12 +207,12 @@ bool task_run(void)
 	panic("task: invalid status (%i)", status);
 }
 
-
 void __attribute__((__noreturn__)) task_run_loop(void)
 {
 	while (true) {
 		/* Work until we run out of ready tasks. */
-		while (task_run());
+		while (task_run())
+			;
 
 		/*
 		 * Sleep until an interrupt or event happens.
@@ -231,7 +223,6 @@ void __attribute__((__noreturn__)) task_run_loop(void)
 		__wfe();
 	}
 }
-
 
 void task_yield(void)
 {
@@ -246,8 +237,7 @@ void task_yield(void)
 	task_swap_context(TASK_YIELD, task_return[core], task->regs);
 }
 
-
-static int64_t task_ready_alarm(alarm_id_t, void *arg)
+static int64_t task_ready_alarm(__unused alarm_id_t alarm, __unused void *arg)
 {
 	task_t task = arg;
 
@@ -261,7 +251,6 @@ static int64_t task_ready_alarm(alarm_id_t, void *arg)
 
 	return 0;
 }
-
 
 void task_sleep_us(uint64_t us)
 {
@@ -278,7 +267,6 @@ void task_sleep_us(uint64_t us)
 	task_yield();
 }
 
-
 void task_sleep_ms(uint64_t ms)
 {
 	unsigned core = get_core_num();
@@ -293,7 +281,6 @@ void task_sleep_ms(uint64_t ms)
 	(void)add_alarm_in_us(1000 * ms, task_ready_alarm, task, true);
 	task_yield();
 }
-
 
 void task_yield_until(uint64_t us)
 {
@@ -310,10 +297,9 @@ void task_yield_until(uint64_t us)
 
 	task_t task = task_running[core];
 	task_running[core]->state = TASK_WAITING_FOR_ALARM;
-	(void)add_alarm_at(us, task_ready_alarm, task, true);
+	(void)add_alarm_at(from_us_since_boot(us), task_ready_alarm, task, true);
 	task_yield();
 }
-
 
 static uint32_t stack_free_space(task_t task)
 {
@@ -329,7 +315,6 @@ static uint32_t stack_free_space(task_t task)
 
 	return level;
 }
-
 
 void task_stats_report_reset(unsigned core)
 {
@@ -375,7 +360,6 @@ void task_stats_report_reset(unsigned core)
 	task_stats_reset(core);
 }
 
-
 void task_stats_reset(unsigned core)
 {
 	for (unsigned t = 0; t < MAX_TASKS; t++) {
@@ -390,7 +374,6 @@ void task_stats_reset(unsigned core)
 
 	last_reset[core] = time_us_64();
 }
-
 
 /****************************************************************************
  * Compatibility layer to use tasks with blocking SDK functions.            *
@@ -425,7 +408,7 @@ void task_lock_spin_unlock_with_wait(struct lock_core *lc, uint32_t save)
 	}
 }
 
-int task_lock_spin_unlock_with_timeout(struct lock_core *lc, uint32_t save, uint64_t time)
+int task_lock_spin_unlock_with_timeout(struct lock_core *lc, uint32_t save, absolute_time_t time)
 {
 	unsigned core = get_core_num();
 	task_t task = task_running[core];
@@ -435,14 +418,14 @@ int task_lock_spin_unlock_with_timeout(struct lock_core *lc, uint32_t save, uint
 		task->state = TASK_WAITING_FOR_LOCK;
 		task->lock_id = ((uint32_t)lc->spin_lock >> 2) & 0x1f;
 		task_yield();
-		return time_us_64() >= time;
+		return time_us_64() >= to_us_since_boot(time);
 	} else {
 		spin_unlock(lc->spin_lock, save);
 		return best_effort_wfe_or_timeout(time);
 	}
 }
 
-void task_sync_yield_until_before(uint64_t time)
+void task_sync_yield_until_before(absolute_time_t time)
 {
-	task_yield_until(time);
+	task_yield_until(to_us_since_boot(time));
 }
