@@ -19,6 +19,8 @@ if (NOT TARGET pico_task)
 
       INTERFACE pico_stdlib
                 pico_util
+                hardware_dma
+                hardware_irq
     )
 
 endif()

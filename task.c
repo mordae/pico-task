@@ -18,6 +18,9 @@
 
 #include <pico/lock_core.h>
 
+#include <hardware/irq.h>
+#include <hardware/dma.h>
+
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
@@ -70,12 +73,12 @@ static void task_sentinel(void)
 	task_swap_context(TASK_RETURN, task_return[core], task->regs);
 }
 
-static int task_select(void)
+static task_t task_select(void)
 {
 	static size_t offset[NUM_CORES] = { 0 };
 
 	unsigned core = get_core_num();
-	int best_task_id = -1;
+	task_t best_task = NULL;
 	int min_pri = INT_MIN;
 
 	for (size_t i = 0; i < MAX_TASKS; i++) {
@@ -87,11 +90,19 @@ static int task_select(void)
 
 		if (TASK_WAITING_FOR_LOCK == task->state) {
 			for (unsigned c = 0; c < NUM_CORES; c++) {
-				if (lock_notify[c][task->lock_id] >= task->resumed_at) {
+				if (lock_notify[c][task->awaitable] >= task->resumed_at) {
 					task->state = TASK_READY;
-					task->lock_id = -1;
+					task->awaitable = -1;
 					break;
 				}
+			}
+		}
+
+		if (TASK_WAITING_FOR_DMA == task->state) {
+			if (!dma_channel_is_busy(task->awaitable)) {
+				task->state = TASK_READY;
+				task->awaitable = -1;
+				break;
 			}
 		}
 
@@ -100,14 +111,13 @@ static int task_select(void)
 
 		if (task->priority > min_pri) {
 			min_pri = task->priority;
-			best_task_id = tid;
+			best_task = task;
 		}
 	}
 
-	if (best_task_id >= 0)
-		offset[core] = (offset[core] + 1) % MAX_TASKS;
+	offset[core] = (offset[core] + 1) % MAX_TASKS;
 
-	return best_task_id;
+	return best_task;
 }
 
 static int64_t task_hung_alarm(__unused alarm_id_t alarm, __unused void *arg)
@@ -115,7 +125,7 @@ static int64_t task_hung_alarm(__unused alarm_id_t alarm, __unused void *arg)
 	for (unsigned i = 0; i < NUM_CORES; i++) {
 		task_t task = task_running[i];
 
-		if (!task)
+		if (NULL == task)
 			continue;
 
 		uint64_t running = time_us_64() - task->resumed_at;
@@ -129,6 +139,13 @@ static int64_t task_hung_alarm(__unused alarm_id_t alarm, __unused void *arg)
 	return -HUNG_TIMEOUT;
 }
 
+static void dma_irq_0(void)
+{
+	irq_clear(DMA_IRQ_0);
+	dma_hw->ints0 = DMA_INTS0_BITS;
+	__sev();
+}
+
 void task_init(void)
 {
 	/*
@@ -136,6 +153,14 @@ void task_init(void)
 	 * task_sleep_{ms,us} functions and for the hung task detector.
 	 */
 	alarm_pool_init_default();
+
+	/* Enable IRQ0 for all channels. */
+	for (unsigned i = 0; i < NUM_DMA_CHANNELS; i++)
+		dma_channel_set_irq0_enabled(i, true);
+
+	/* We are handling DMA IRQ 0. */
+	irq_set_exclusive_handler(DMA_IRQ_0, dma_irq_0);
+	irq_set_enabled(DMA_IRQ_0, true);
 
 	/* Initialize the defined tasks. */
 	for (unsigned i = 0; i < NUM_CORES; i++) {
@@ -170,12 +195,10 @@ void task_init(void)
 bool task_run(void)
 {
 	unsigned core = get_core_num();
-	int task_no = task_select();
+	task_t task = task_select();
 
-	if (task_no < 0)
+	if (NULL == task)
 		return false;
-
-	task_t task = task_avail[core][task_no];
 
 	task_running[core] = task;
 	task->resume_count++;
@@ -255,14 +278,14 @@ static int64_t task_ready_alarm(__unused alarm_id_t alarm, __unused void *arg)
 void task_sleep_us(uint64_t us)
 {
 	unsigned core = get_core_num();
+	task_t task = task_running[core];
 
-	if (NULL == task_running[core]) {
+	if (NULL == task) {
 		sleep_us(us);
 		return;
 	}
 
-	task_t task = task_running[core];
-	task_running[core]->state = TASK_WAITING_FOR_ALARM;
+	task->state = TASK_WAITING_FOR_ALARM;
 	(void)add_alarm_in_us(us, task_ready_alarm, task, true);
 	task_yield();
 }
@@ -270,14 +293,14 @@ void task_sleep_us(uint64_t us)
 void task_sleep_ms(uint64_t ms)
 {
 	unsigned core = get_core_num();
+	task_t task = task_running[core];
 
-	if (NULL == task_running[core]) {
+	if (NULL == task) {
 		sleep_ms(ms);
 		return;
 	}
 
-	task_t task = task_running[core];
-	task_running[core]->state = TASK_WAITING_FOR_ALARM;
+	task->state = TASK_WAITING_FOR_ALARM;
 	(void)add_alarm_in_us(1000 * ms, task_ready_alarm, task, true);
 	task_yield();
 }
@@ -285,8 +308,9 @@ void task_sleep_ms(uint64_t ms)
 void task_yield_until(uint64_t us)
 {
 	unsigned core = get_core_num();
+	task_t task = task_running[core];
 
-	if (NULL == task_running[core]) {
+	if (NULL == task) {
 		uint64_t now = time_us_64();
 
 		if (now < us)
@@ -295,9 +319,26 @@ void task_yield_until(uint64_t us)
 		return;
 	}
 
-	task_t task = task_running[core];
-	task_running[core]->state = TASK_WAITING_FOR_ALARM;
+	task->state = TASK_WAITING_FOR_ALARM;
 	(void)add_alarm_at(from_us_since_boot(us), task_ready_alarm, task, true);
+	task_yield();
+}
+
+void task_wait_for_dma(uint8_t dma_ch_id)
+{
+	if (!dma_channel_is_busy(dma_ch_id))
+		return;
+
+	unsigned core = get_core_num();
+	task_t task = task_running[core];
+
+	if (NULL == task) {
+		dma_channel_wait_for_finish_blocking(dma_ch_id);
+		return;
+	}
+
+	task->awaitable = dma_ch_id;
+	task->state = TASK_WAITING_FOR_DMA;
 	task_yield();
 }
 
@@ -334,20 +375,25 @@ void task_stats_report_reset(unsigned core)
 		unsigned stack = stack_free_space(task);
 
 		char flags[] = "?";
-		int lock_id = task->lock_id;
+
+		int awaitable = task->awaitable;
 		enum task_state state = task->state;
 
 		if (TASK_READY == state)
-			flags[0] = 'R';
+			flags[0] = 'r';
 		else if (TASK_WAITING_FOR_ALARM == state)
 			flags[0] = 'A';
 		else if (TASK_WAITING_FOR_LOCK == state)
 			flags[0] = 'L';
+		else if (TASK_WAITING_FOR_DMA == state)
+			flags[0] = 'D';
 
 		printf("task: %2i (%-2i ", i, task->priority);
 
 		if (TASK_WAITING_FOR_LOCK == state) {
-			printf("%s=%-2i", flags, lock_id);
+			printf("%s=%-2i", flags, awaitable);
+		} else if (TASK_WAITING_FOR_DMA == state) {
+			printf("%s=%-2i", flags, awaitable);
 		} else {
 			printf("%s   ", flags);
 		}
@@ -400,7 +446,7 @@ void task_lock_spin_unlock_with_wait(struct lock_core *lc, uint32_t save)
 	if (task) {
 		spin_unlock(lc->spin_lock, save);
 		task->state = TASK_WAITING_FOR_LOCK;
-		task->lock_id = ((uint32_t)lc->spin_lock >> 2) & 0x1f;
+		task->awaitable = ((uint32_t)lc->spin_lock >> 2) & 0x1f;
 		task_yield();
 	} else {
 		spin_unlock(lc->spin_lock, save);
@@ -416,7 +462,7 @@ int task_lock_spin_unlock_with_timeout(struct lock_core *lc, uint32_t save, abso
 	if (task) {
 		spin_unlock(lc->spin_lock, save);
 		task->state = TASK_WAITING_FOR_LOCK;
-		task->lock_id = ((uint32_t)lc->spin_lock >> 2) & 0x1f;
+		task->awaitable = ((uint32_t)lc->spin_lock >> 2) & 0x1f;
 		task_yield();
 		return time_us_64() >= to_us_since_boot(time);
 	} else {

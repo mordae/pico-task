@@ -32,6 +32,7 @@ enum task_state {
 	TASK_READY = 0,
 	TASK_WAITING_FOR_ALARM,
 	TASK_WAITING_FOR_LOCK,
+	TASK_WAITING_FOR_DMA,
 };
 
 struct task {
@@ -53,8 +54,8 @@ struct task {
 	/* Reason the task is waiting. */
 	enum task_state state : 8;
 
-	/* Lock for which the task is waiting. */
-	int lock_id : 24;
+	/* Lock or DMA channel for which the task is waiting. */
+	int awaitable : 24;
 
 	/* Notification about lock status. */
 	uint32_t notify;
@@ -130,6 +131,9 @@ void task_sleep_ms(uint64_t ms);
 
 /* Yield task until given time in microseconds. */
 void task_yield_until(uint64_t us);
+
+/* For until given DMA channel completes. */
+void task_wait_for_dma(uint8_t dma_ch_id);
 
 /* Print per-task statistics for given core and then reset them. */
 void task_stats_report_reset(unsigned core);
