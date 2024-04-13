@@ -132,7 +132,10 @@ void task_sleep_ms(uint64_t ms);
 /* Yield task until given time in microseconds. */
 void task_yield_until(uint64_t us);
 
-/* For until given DMA channel completes. */
+/*
+ * Yield task if the DMA has not triggered irq0 since the task has woken up.
+ * Must be combined with another check (such as whether is the channel busy).
+ */
 void task_wait_for_dma(uint8_t dma_ch_id);
 
 /* Print per-task statistics for given core and then reset them. */

@@ -52,7 +52,10 @@ static unsigned task_offset[NUM_CORES] = { 0 };
 static unsigned task_return[NUM_CORES][TASK_NUM_REGS];
 
 /* Spinlock notifications for respective cores: */
-static uint64_t lock_notify[NUM_CORES][32] = { 0 };
+static uint64_t lock_notify[NUM_CORES][NUM_SPIN_LOCKS] = { 0 };
+
+/* DMA IRQ notifications: */
+static uint64_t dma_notify[NUM_DMA_CHANNELS] = { 0 };
 
 /* Microseconds since last per-core stats reset. */
 static uint64_t last_reset[NUM_CORES] = { 0 };
@@ -100,7 +103,7 @@ static task_t __time_critical_func(task_select)(void)
 		}
 
 		if (TASK_WAITING_FOR_DMA == task->state) {
-			if (!dma_channel_is_busy(task->awaitable)) {
+			if (dma_notify[task->awaitable] >= task->resumed_at) {
 				task->state = TASK_READY;
 				task->awaitable = -1;
 				break;
@@ -143,6 +146,13 @@ static int64_t task_hung_alarm(__unused alarm_id_t alarm, __unused void *arg)
 static void __isr __time_critical_func(dma_irq_0)(void)
 {
 	irq_clear(DMA_IRQ_0);
+
+	uint64_t now = time_us_64();
+
+	for (unsigned i = 0; i < NUM_DMA_CHANNELS; i++)
+		if (dma_hw->ints0 & (1u << i))
+			dma_notify[i] = now;
+
 	dma_hw->ints0 = DMA_INTS0_BITS;
 	__sev();
 }
@@ -327,16 +337,11 @@ void task_yield_until(uint64_t us)
 
 void task_wait_for_dma(uint8_t dma_ch_id)
 {
-	if (!dma_channel_is_busy(dma_ch_id))
-		return;
-
 	unsigned core = get_core_num();
 	task_t task = task_running[core];
 
-	if (NULL == task) {
-		dma_channel_wait_for_finish_blocking(dma_ch_id);
-		return;
-	}
+	if (NULL == task)
+		panic("task_wait_for_dma called outside a task");
 
 	task->awaitable = dma_ch_id;
 	task->state = TASK_WAITING_FOR_DMA;
