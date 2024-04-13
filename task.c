@@ -76,7 +76,7 @@ static void task_sentinel(void)
 	task_swap_context(TASK_RETURN, task_return[core], task->regs);
 }
 
-static task_t task_select(void)
+static task_t __time_critical_func(task_select)(void)
 {
 	unsigned core = get_core_num();
 	task_t best_task = NULL;
@@ -140,7 +140,7 @@ static int64_t task_hung_alarm(__unused alarm_id_t alarm, __unused void *arg)
 	return -HUNG_TIMEOUT;
 }
 
-static void dma_irq_0(void)
+static void __isr __time_critical_func(dma_irq_0)(void)
 {
 	irq_clear(DMA_IRQ_0);
 	dma_hw->ints0 = DMA_INTS0_BITS;
@@ -193,7 +193,7 @@ void task_init(void)
 	(void)add_alarm_in_us(HUNG_TIMEOUT, task_hung_alarm, NULL, true);
 }
 
-bool task_run(void)
+bool __time_critical_func(task_run)(void)
 {
 	unsigned core = get_core_num();
 	task_t task = task_select();
@@ -231,7 +231,7 @@ bool task_run(void)
 	panic("task: invalid status (%i)", status);
 }
 
-void __attribute__((__noreturn__)) task_run_loop(void)
+void __attribute__((__noreturn__)) __time_critical_func(task_run_loop)(void)
 {
 	while (true) {
 		/* Work until we run out of ready tasks. */

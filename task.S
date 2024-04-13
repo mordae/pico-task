@@ -8,7 +8,9 @@ pico_default_asm_setup
  * r2: address to save registers to
  * r3: scratch register
  */
-regular_func_with_section task_swap_context
+.section .time_critical.task_swap_context
+regular_func task_swap_context
+
 	/* Save the lower registers + SP. */
 	mov r3, sp
 	stmia r2!, {r3-r7}
