@@ -45,6 +45,9 @@ enum task_status task_swap_context(enum task_status, unsigned load[TASK_NUM_REGS
 /* Saved register offsets. */
 enum reg_offset { SP = 0, R4, R5, R6, R7, R8, R9, R10, R11, R12, LR };
 
+/* Offset to start selecting tasks from. */
+static unsigned task_offset[NUM_CORES] = { 0 };
+
 /* Saved scheduler registers for respective cores: */
 static unsigned task_return[NUM_CORES][TASK_NUM_REGS];
 
@@ -75,14 +78,12 @@ static void task_sentinel(void)
 
 static task_t task_select(void)
 {
-	static size_t offset[NUM_CORES] = { 0 };
-
 	unsigned core = get_core_num();
 	task_t best_task = NULL;
 	int min_pri = INT_MIN;
 
 	for (size_t i = 0; i < MAX_TASKS; i++) {
-		size_t tid = (offset[core] + i) % MAX_TASKS;
+		size_t tid = (task_offset[core] + i) % MAX_TASKS;
 		task_t task = task_avail[core][tid];
 
 		if (NULL == task)
@@ -115,7 +116,7 @@ static task_t task_select(void)
 		}
 	}
 
-	offset[core] = (offset[core] + 1) % MAX_TASKS;
+	task_offset[core] = (task_offset[core] + 1) % MAX_TASKS;
 
 	return best_task;
 }
