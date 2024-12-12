@@ -103,7 +103,8 @@ static task_t __time_critical_func(task_select)(void)
 		}
 
 		if (TASK_WAITING_FOR_DMA == task->state) {
-			if (dma_notify[task->awaitable] >= task->resumed_at) {
+			if (!dma_channel_is_busy(task->awaitable) ||
+			    (dma_notify[task->awaitable] >= task->resumed_at)) {
 				task->state = TASK_READY;
 				task->awaitable = -1;
 				break;
