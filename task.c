@@ -20,6 +20,7 @@
 
 #include <hardware/irq.h>
 #include <hardware/dma.h>
+#include <hardware/structs/bus_ctrl.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -59,6 +60,9 @@ static uint64_t dma_notify[NUM_DMA_CHANNELS] = { 0 };
 
 /* Microseconds since last per-core stats reset. */
 static uint64_t last_reset[NUM_CORES] = { 0 };
+
+/* Memory performance counters. */
+static uint64_t perf_bus_ctr[20] = { 0 };
 
 /* Currently running tasks for respective cores: */
 task_t task_running[NUM_CORES] = { NULL };
@@ -144,6 +148,30 @@ static int64_t task_hung_alarm(__unused alarm_id_t alarm, __unused void *arg)
 	return -HUNG_TIMEOUT;
 }
 
+static int64_t task_perf_sample(__unused alarm_id_t alarm, __unused void *arg)
+{
+	/* Determine currently active counters. */
+	int ctr = bus_ctrl_hw->counter[0].sel;
+	int next = ctr + 4;
+
+	if (next >= 20)
+		next = 0;
+
+	for (int i = 0; i < 4; i++) {
+		/* Add the values to 64b accumulators. */
+		perf_bus_ctr[ctr + i] += bus_ctrl_hw->counter[i].value;
+
+		/* Change to next counter in sequence. */
+		bus_ctrl_hw->counter[i].sel = next + i;
+
+		/* Clear the counter. */
+		bus_ctrl_hw->counter[i].value = 0;
+	}
+
+	/* Repeat every 200ms. So one sample from each every second. */
+	return -200 * 1000;
+}
+
 static void __isr __time_critical_func(dma_irq_0)(void)
 {
 	irq_clear(DMA_IRQ_0);
@@ -202,6 +230,20 @@ void task_init(void)
 
 	/* Start hung task detector. */
 	(void)add_alarm_in_us(HUNG_TIMEOUT, task_hung_alarm, NULL, true);
+
+	/* Clear perf counters. */
+	bus_ctrl_hw->counter[0].sel = 0;
+	bus_ctrl_hw->counter[1].sel = 1;
+	bus_ctrl_hw->counter[2].sel = 2;
+	bus_ctrl_hw->counter[3].sel = 3;
+
+	bus_ctrl_hw->counter[0].value = 0;
+	bus_ctrl_hw->counter[1].value = 0;
+	bus_ctrl_hw->counter[2].value = 0;
+	bus_ctrl_hw->counter[3].value = 0;
+
+	/* Start memory performance counter servicing. */
+	(void)add_alarm_in_us(10000, task_perf_sample, NULL, true);
 }
 
 bool __time_critical_func(task_run)(void)
@@ -426,6 +468,31 @@ void task_stats_reset(unsigned core)
 	}
 
 	last_reset[core] = time_us_64();
+}
+
+void task_stats_memory_reset(void)
+{
+	static const char *labels[] = { "apb", "per", "sry", "srx", "sr3",
+					"sr2", "sr1", "sr0", "xip", "rom" };
+
+	printf("mem:");
+
+	for (int i = 0; i < 20; i += 2) {
+		float contested = perf_bus_ctr[i];
+		float total = perf_bus_ctr[i + 1];
+
+		perf_bus_ctr[i] = 0;
+		perf_bus_ctr[i + 1] = 0;
+
+		float ratio = 100.0f * contested / total;
+
+		printf(" %s=%05.02f", labels[i >> 1], ratio);
+
+		if (8 == i)
+			printf("\nmem:");
+	}
+
+	printf("\n");
 }
 
 /****************************************************************************

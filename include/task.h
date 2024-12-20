@@ -141,5 +141,8 @@ void task_wait_for_dma(uint8_t dma_ch_id);
 /* Print per-task statistics for given core and then reset them. */
 void task_stats_report_reset(unsigned core);
 
+/* Print memory performance statistics and reset them. */
+void task_stats_memory_reset(void);
+
 /* Reset task statistics for given core. */
 void task_stats_reset(unsigned core);
